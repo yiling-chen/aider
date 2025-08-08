@@ -215,6 +215,7 @@ def main(
     exercises_dir: str = typer.Option(
         EXERCISES_DIR_DEFAULT, "--exercises-dir", help="Directory with exercise files"
     ),
+    dump: bool = typer.Option(False, "--dump", help="Dump LLM messages"),
 ):
     repo = git.Repo(search_parent_directories=True)
     commit_hash = repo.head.object.hexsha[:7]
@@ -350,6 +351,20 @@ def main(
     base_coder.RETRY_TIMEOUT = LONG_TIMEOUT
     models.RETRY_TIMEOUT = LONG_TIMEOUT
 
+    # NOTE: for data generation only
+    if dump:
+        for test_path in test_dnames:
+            run_test_fake(
+                original_dname,
+                dirname / test_path,
+                model,
+                edit_format,
+                verbose,
+                editor_model=editor_model,
+                editor_edit_format=editor_edit_format,
+            )
+        return
+
     if threads == 1:
         all_results = []
         for test_path in test_dnames:
@@ -405,6 +420,179 @@ def main(
     summarize_results(dirname)
 
     return 0
+
+
+def convert_message(message):
+    if message['role'] == 'system':
+        return {
+            "author": {"role": "system"},
+            "content": {
+                "content_type": "system_content",
+                "instructions": message['content'],
+            }
+        }
+    else:  # message['role'] == 'user' or message['role'] == 'assistant':
+        return {
+            "author": {"role": message['role']},
+            "content": {
+                "content_type": "text",
+                "parts": [message['content']],
+            }
+        }
+
+
+def run_test_fake(
+    original_dname,
+    testdir,
+    model_name,
+    edit_format,
+    verbose,
+    editor_model,
+    editor_edit_format,
+):
+    if not os.path.isdir(testdir):
+        print("Not a dir:", testdir)
+        return
+
+    testdir = Path(testdir)
+    print("Processing testdir:", testdir)
+
+    # Read solution and test files from config
+    fnames = []
+    config_file = testdir / ".meta/config.json"
+    if not config_file.exists():
+        raise ValueError(f"No config file found: {config_file}")
+
+    with open(config_file) as f:
+        config = json.loads(f.read())
+
+    # Get file sets from config
+    test_files = config.get("files", {}).get("test", [])
+    example_files = config.get("files", {}).get("example", [])
+    solution_files = set(config.get("files", {}).get("solution", []))
+
+    # Forcibly ignore certain files not covered by test_files and example_files
+    ignore_files = set(
+        [
+            "CMakeLists.txt",
+            "Cargo.toml",
+        ]
+    )
+
+    # Add all files under .meta and .docs directories
+    ignore_files.update(str(p.relative_to(testdir)) for p in testdir.glob(".meta/**/*"))
+    ignore_files.update(str(p.relative_to(testdir)) for p in testdir.glob(".docs/**/*"))
+
+    # Also ignore test & example files
+    ignore_files.update(test_files)
+    ignore_files.update(example_files)
+
+    # Remove any ignore files from the solution set that LLM will edit
+    solution_files.difference_update(ignore_files)
+
+    # Copy all solution files
+    for file_path in solution_files:
+        src = testdir / Path(file_path)
+        if src.exists():
+            fnames.append(src)
+            # restore the original file, in case we interrupted a prev run
+            # Find the original file in the language-specific practice dir
+            lang_part = str(testdir).split("/exercises/practice/")[0]
+            original_fname = (
+                original_dname
+                / Path(lang_part).name
+                / "exercises"
+                / "practice"
+                / testdir.name
+                / file_path
+            )
+            if original_fname.exists():
+                os.makedirs(src.parent, exist_ok=True)
+                shutil.copy(original_fname, src)
+        else:
+            print(f"Warning: Solution file not found: {src}")
+
+    file_list = " ".join(fname.name for fname in fnames)
+
+    instructions = ""
+
+    introduction = testdir / ".docs/introduction.md"
+    if introduction.exists():
+        instructions += introduction.read_text()
+    instructions += (testdir / ".docs/instructions.md").read_text()
+    instructions_append = testdir / ".docs/instructions.append.md"
+    if instructions_append.exists():
+        instructions += instructions_append.read_text()
+
+    instructions += prompts.instructions_addendum.format(file_list=file_list)
+
+    io = InputOutput(
+        pretty=False,
+        yes=True,
+    )
+
+    # weak_model_name = model_name
+    weak_model_name = None
+
+    main_model = models.Model(
+        model_name,
+        weak_model=weak_model_name,
+        editor_model=editor_model,
+        editor_edit_format=editor_edit_format,
+        verbose=verbose,
+    )
+
+    edit_format = edit_format or main_model.edit_format
+
+    coder = Coder.create(
+        main_model,
+        edit_format,
+        io,
+        fnames=fnames,
+        use_git=False,
+        stream=False,
+        verbose=verbose,
+        # auto_lint=False,  # disabled for code-in-json experiments
+        cache_prompts=True,
+        suggest_shell_commands=False,
+        ignore_mentions=ignore_files,
+    )
+    coder.show_announcements()
+    coder.get_file_mentions = lambda x: set()  # No loading of any other files
+
+    messages = coder.compose_llm_messages(with_message=instructions)
+
+    language = str(testdir).split("/exercises/practice/")[0].split("/")[-1]
+
+    final_data = {
+        "problem": config["blurb"],
+        "unique_id": f"{language}_{testdir.name}",
+        "solution": "SOLUTION",
+        "answer": "ANSWER",
+        "metadata": {
+            "scenario": {
+                "name": testdir.name,
+                "idx": f"{language}_{testdir.name}",
+                "instructions": instructions,
+                "language": language,
+                "source_filenames": list(solution_files),
+                "test_filenames": test_files,
+                "ignore_filenames": list(ignore_files),
+                "example_filenames": example_files,
+                "source_files": {fname: (testdir / fname).read_text() for fname in solution_files},
+                "test_files": {fname: (testdir / fname).read_text() for fname in test_files},
+                "mode": "whole",
+                "aider_src": "",
+                "refactor_src": ""
+            }
+        },
+        "messages": [
+            convert_message(message) for message in messages
+        ]
+    }
+
+    with open("polyglot_benchmark.jsonl", "a") as f:
+        f.write(json.dumps(final_data) + "\n")
 
 
 def show_diffs(dirnames):

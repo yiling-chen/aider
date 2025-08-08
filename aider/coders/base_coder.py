@@ -891,6 +891,28 @@ class Coder:
         except EOFError:
             return
 
+    def compose_llm_messages(self, with_message=None):
+        """
+        Compose the full messages to send to the LLM, including user input.
+        This replicates the exact message composition as used in send().
+        """
+        # Optionally add the user message to cur_messages (like send_message does)
+        if with_message is not None:
+            # Save current cur_messages to restore after composing
+            orig_cur_messages = list(self.cur_messages)
+            self.cur_messages += [dict(role="user", content=with_message)]
+
+        chunks = self.format_chat_chunks()
+        if self.add_cache_headers:
+            chunks.add_cache_control_headers()
+        messages = chunks.all_messages()
+
+        # Restore cur_messages if we modified it
+        if with_message is not None:
+            self.cur_messages = orig_cur_messages
+
+        return messages
+
     def copy_context(self):
         if self.auto_copy_context:
             self.commands.cmd_copy_context()
